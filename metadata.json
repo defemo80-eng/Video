@@ -1,0 +1,6 @@
+{
+  "name": "DeiPlay",
+  "description": "DeiPlay - El mundo entero del video en un solo lugar. Plataforma global de videos, Shorts, canales, DeiPlay Studio y transmisiones sin anuncios.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
