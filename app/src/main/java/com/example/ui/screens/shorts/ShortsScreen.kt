@@ -1,6 +1,12 @@
 package com.example.ui.screens.shorts
 
 import android.content.Intent
+import android.net.Uri
+import android.view.LayoutInflater
+import androidx.annotation.OptIn
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -22,12 +28,17 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Comment
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.OpenInNew
+import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material.icons.filled.VideoCameraFront
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -40,6 +51,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -57,12 +69,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.example.data.local.VideoEntity
-import com.example.data.remote.NetworkModule
 import com.example.ui.DeiPlayViewModel
 import com.example.ui.components.ChannelAvatar
 import com.example.ui.components.EmptyStateCard
@@ -71,7 +85,8 @@ import com.example.ui.theme.DeiBlack
 import com.example.ui.theme.DeiRed
 import com.example.ui.theme.DeiWhite
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(UnstableApi::class)
+@kotlin.OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ShortsScreen(
     viewModel: DeiPlayViewModel,
@@ -80,11 +95,14 @@ fun ShortsScreen(
     modifier: Modifier = Modifier
 ) {
     val shorts by viewModel.shortsVideos.collectAsStateWithLifecycle()
+    val targetShortId by viewModel.selectedShortId.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     if (shorts.isEmpty()) {
         Box(
-            modifier = modifier.fillMaxSize().background(DeiBlack),
+            modifier = modifier
+                .fillMaxSize()
+                .background(DeiBlack),
             contentAlignment = Alignment.Center
         ) {
             EmptyStateCard(
@@ -98,39 +116,117 @@ fun ShortsScreen(
         return
     }
 
-    val pagerState = rememberPagerState(pageCount = { shorts.size })
+    val initialPage = remember(shorts, targetShortId) {
+        val idx = targetShortId?.let { id -> shorts.indexOfFirst { it.id == id } } ?: 0
+        if (idx >= 0) idx else 0
+    }
+    val pagerState = rememberPagerState(initialPage = initialPage, pageCount = { shorts.size })
+
+    LaunchedEffect(targetShortId, shorts) {
+        val id = targetShortId ?: return@LaunchedEffect
+        val idx = shorts.indexOfFirst { it.id == id }
+        if (idx >= 0 && idx != pagerState.currentPage) {
+            pagerState.scrollToPage(idx)
+        }
+        viewModel.selectShortToOpen(null)
+    }
+
     val shortPlayer = remember {
         ExoPlayer.Builder(context.applicationContext).build().apply {
             repeatMode = Player.REPEAT_MODE_ONE
         }
     }
 
-    DisposableEffect(Unit) {
-        onDispose { shortPlayer.release() }
+    var firstFrameRendered by remember { mutableStateOf(false) }
+    var isBuffering by remember { mutableStateOf(true) }
+    var isPaused by remember { mutableStateOf(false) }
+    var playbackError by remember { mutableStateOf<String?>(null) }
+    var isExternalWebShort by remember { mutableStateOf(false) }
+    var reloadNonce by remember { mutableIntStateOf(0) }
+
+    DisposableEffect(shortPlayer) {
+        val listener = object : Player.Listener {
+            override fun onRenderedFirstFrame() {
+                firstFrameRendered = true
+                isBuffering = false
+                playbackError = null
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                when (playbackState) {
+                    Player.STATE_BUFFERING -> isBuffering = true
+                    Player.STATE_READY -> {
+                        isBuffering = false
+                        playbackError = null
+                    }
+                    Player.STATE_IDLE, Player.STATE_ENDED -> isBuffering = false
+                }
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                isPaused = !isPlaying && shortPlayer.playbackState == Player.STATE_READY
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                isBuffering = false
+                firstFrameRendered = false
+                playbackError = "No se pudo reproducir el video directamente aquí."
+            }
+        }
+        shortPlayer.addListener(listener)
+        onDispose {
+            shortPlayer.removeListener(listener)
+            shortPlayer.release()
+        }
     }
 
     var activeShortComments by remember { mutableStateOf<VideoEntity?>(null) }
 
-    LaunchedEffect(pagerState.currentPage, shorts) {
+    LaunchedEffect(pagerState.currentPage, shorts, reloadNonce) {
         val current = shorts.getOrNull(pagerState.currentPage) ?: return@LaunchedEffect
-        val playableUrl = if (current.sourcePlatform == "DEIPLAY" || current.mediaUri.startsWith("file://")) {
-            current.mediaUri
-        } else if (current.sourcePlatform == "PEERTUBE") {
-            // Resolve origin PeerTube MP4/HLS quickly
-            runCatching {
-                val uri = java.net.URI(current.externalUrl ?: current.mediaUri)
-                val host = uri.host
-                val uuid = current.id.removePrefix("pt_")
-                val detail = NetworkModule.peerTubeService.getVideoDetails("https://$host/api/v1/videos/$uuid")
-                detail.files.firstOrNull()?.fileUrl
-                    ?: detail.streamingPlaylists.firstOrNull()?.files?.firstOrNull()?.fileUrl
-                    ?: detail.streamingPlaylists.firstOrNull()?.playlistUrl
-                    ?: current.mediaUri
-            }.getOrDefault(current.mediaUri)
-        } else current.mediaUri
+        firstFrameRendered = false
+        isBuffering = true
+        isPaused = false
+        playbackError = null
+        isExternalWebShort = false
+        shortPlayer.stop()
+        shortPlayer.clearMediaItems()
 
-        if (playableUrl.isNotBlank() && !playableUrl.contains("youtube.com/watch")) {
-            shortPlayer.setMediaItem(MediaItem.fromUri(playableUrl))
+        val resolved = runCatching {
+            viewModel.resolvePlayableStreamsForShort(current)
+        }.getOrNull()
+
+        val candidateUrls = resolved?.streams?.map { it.url }?.filter { it.isNotBlank() }.orEmpty()
+        val chosenUrl = candidateUrls.firstOrNull { url ->
+            url.startsWith("file://") ||
+                url.startsWith("content://") ||
+                url.contains(".mp4", ignoreCase = true) ||
+                url.contains(".m3u8", ignoreCase = true) ||
+                url.contains(".webm", ignoreCase = true) ||
+                url.contains("/static/", ignoreCase = true) ||
+                url.contains("/download/", ignoreCase = true)
+        } ?: candidateUrls.firstOrNull() ?: current.mediaUri
+
+        val looksLikeYouTubeWeb = chosenUrl.contains("youtube.com/watch", ignoreCase = true) ||
+            chosenUrl.contains("youtu.be/", ignoreCase = true) ||
+            chosenUrl.contains("youtube.com/shorts/", ignoreCase = true)
+        val looksLikePeerTubeHtmlPage = current.sourcePlatform == "PEERTUBE" &&
+            (chosenUrl == current.mediaUri ||
+                chosenUrl.contains("/w/", ignoreCase = true) ||
+                chosenUrl.contains("/videos/watch/", ignoreCase = true)) &&
+            !chosenUrl.contains(".mp4", ignoreCase = true) &&
+            !chosenUrl.contains(".m3u8", ignoreCase = true)
+
+        if (looksLikeYouTubeWeb || looksLikePeerTubeHtmlPage || chosenUrl.isBlank()) {
+            isBuffering = false
+            isExternalWebShort = true
+            playbackError = if (looksLikeYouTubeWeb) {
+                "Short de YouTube: abre en YouTube o usa un Short nativo de DeiPlay."
+            } else {
+                "Este creador externo aún no expone stream directo en MP4/HLS."
+            }
+        } else {
+            shortPlayer.setMediaItem(MediaItem.fromUri(chosenUrl))
             shortPlayer.prepare()
             shortPlayer.playWhenReady = true
         }
@@ -151,12 +247,25 @@ fun ShortsScreen(
             val reaction by viewModel.observeReaction(shortVideo.id).collectAsStateWithLifecycle(initialValue = null)
             val sub by viewModel.observeSubscription(shortVideo.channelId).collectAsStateWithLifecycle(initialValue = null)
 
-            Box(modifier = Modifier.fillMaxSize()) {
-                if (isCurrentPage) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color(0xFF140708), DeiBlack, Color(0xFF120608))
+                        )
+                    )
+            ) {
+                // Active ExoPlayer surface
+                if (isCurrentPage && !isExternalWebShort && playbackError == null) {
                     AndroidView(
                         factory = { ctx ->
-                            PlayerView(ctx).apply {
-                                useController = false
+                            (LayoutInflater.from(ctx).inflate(
+                                com.example.R.layout.view_short_player,
+                                null,
+                                false
+                            ) as PlayerView).apply {
+                                keepScreenOn = true
                                 player = shortPlayer
                             }
                         },
@@ -166,26 +275,164 @@ fun ShortsScreen(
                         modifier = Modifier
                             .fillMaxSize()
                             .clickable {
-                                if (shortPlayer.isPlaying) shortPlayer.pause() else shortPlayer.play()
+                                if (shortPlayer.isPlaying) {
+                                    shortPlayer.pause()
+                                    isPaused = true
+                                } else {
+                                    shortPlayer.play()
+                                    isPaused = false
+                                }
                             }
-                    )
-                } else if (!shortVideo.thumbnailUri.isNullOrBlank()) {
-                    AsyncImage(
-                        model = shortVideo.thumbnailUri,
-                        contentDescription = shortVideo.title,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
                     )
                 }
 
-                // Bottom gradient for readability
+                // Always show thumbnail/poster cleanly until first video frame actually renders (eliminates black screen!)
+                val showPosterOverlay = !isCurrentPage || !firstFrameRendered || isExternalWebShort || playbackError != null
+                AnimatedVisibility(
+                    visible = showPosterOverlay,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        if (!shortVideo.thumbnailUri.isNullOrBlank()) {
+                            AsyncImage(
+                                model = shortVideo.thumbnailUri,
+                                contentDescription = shortVideo.title,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(
+                                        Brush.radialGradient(
+                                            listOf(DeiRed.copy(alpha = 0.28f), DeiBlack)
+                                        )
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Bolt,
+                                    contentDescription = null,
+                                    tint = DeiRed.copy(alpha = 0.85f),
+                                    modifier = Modifier.size(64.dp)
+                                )
+                            }
+                        }
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(DeiBlack.copy(alpha = 0.24f))
+                        )
+                    }
+                }
+
+                // Buffering / Pause / Fallback center controls
+                if (isCurrentPage) {
+                    when {
+                        playbackError != null -> {
+                            Surface(
+                                shape = RoundedCornerShape(18.dp),
+                                color = DeiBlack.copy(alpha = 0.78f),
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .padding(horizontal = 28.dp)
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(18.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Text(
+                                        text = playbackError!!,
+                                        color = DeiWhite,
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                        Button(
+                                            onClick = { reloadNonce++ },
+                                            colors = ButtonDefaults.buttonColors(containerColor = DeiRed, contentColor = DeiWhite)
+                                        ) {
+                                            Icon(Icons.Filled.Refresh, null, modifier = Modifier.size(18.dp))
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Reintentar")
+                                        }
+                                        val extUrl = shortVideo.externalUrl ?: shortVideo.mediaUri
+                                        if (extUrl.startsWith("http")) {
+                                            Button(
+                                                onClick = {
+                                                    runCatching {
+                                                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(extUrl)))
+                                                    }
+                                                },
+                                                colors = ButtonDefaults.buttonColors(
+                                                    containerColor = Color.White.copy(alpha = 0.2f),
+                                                    contentColor = DeiWhite
+                                                )
+                                            ) {
+                                                Icon(Icons.Filled.OpenInNew, null, modifier = Modifier.size(18.dp))
+                                                Spacer(Modifier.width(6.dp))
+                                                Text("Abrir origen")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        isBuffering && !firstFrameRendered -> {
+                            CircularProgressIndicator(
+                                color = DeiRed,
+                                strokeWidth = 3.dp,
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .size(44.dp)
+                            )
+                        }
+
+                        isPaused -> {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .size(64.dp)
+                                    .clip(CircleShape)
+                                    .background(DeiBlack.copy(alpha = 0.6f))
+                                    .clickable {
+                                        shortPlayer.play()
+                                        isPaused = false
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.PlayArrow,
+                                    contentDescription = "Reanudar Short",
+                                    tint = DeiWhite,
+                                    modifier = Modifier.size(36.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Top & bottom gradients for readability
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(220.dp)
+                        .height(110.dp)
+                        .align(Alignment.TopCenter)
+                        .background(
+                            Brush.verticalGradient(listOf(DeiBlack.copy(alpha = 0.72f), Color.Transparent))
+                        )
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(240.dp)
                         .align(Alignment.BottomCenter)
                         .background(
-                            Brush.verticalGradient(listOf(Color.Transparent, DeiBlack.copy(alpha = 0.88f)))
+                            Brush.verticalGradient(listOf(Color.Transparent, DeiBlack.copy(alpha = 0.90f)))
                         )
                 )
 
@@ -193,19 +440,32 @@ fun ShortsScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(16.dp)
+                        .padding(horizontal = 16.dp, vertical = 14.dp)
                         .align(Alignment.TopCenter),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "DeiPlay Shorts",
-                        style = MaterialTheme.typography.titleLarge,
-                        color = DeiWhite,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(30.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(DeiRed),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Filled.Bolt, null, tint = DeiWhite, modifier = Modifier.size(18.dp))
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "Shorts",
+                            style = MaterialTheme.typography.titleLarge,
+                            color = DeiWhite,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                     Button(
                         onClick = onUploadShort,
+                        shape = RoundedCornerShape(20.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = DeiRed, contentColor = DeiWhite)
                     ) {
                         Icon(Icons.Filled.Add, null, modifier = Modifier.size(18.dp))
@@ -227,7 +487,7 @@ fun ShortsScreen(
                             onClick = { viewModel.toggleReaction(shortVideo, "LIKE") },
                             modifier = Modifier
                                 .size(48.dp)
-                                .background(DeiBlack.copy(alpha = 0.5f), CircleShape)
+                                .background(DeiBlack.copy(alpha = 0.55f), CircleShape)
                         ) {
                             Icon(
                                 Icons.Filled.ThumbUp,
@@ -243,7 +503,7 @@ fun ShortsScreen(
                             onClick = { activeShortComments = shortVideo },
                             modifier = Modifier
                                 .size(48.dp)
-                                .background(DeiBlack.copy(alpha = 0.5f), CircleShape)
+                                .background(DeiBlack.copy(alpha = 0.55f), CircleShape)
                         ) {
                             Icon(Icons.AutoMirrored.Filled.Comment, contentDescription = "Comentarios", tint = DeiWhite)
                         }
@@ -260,18 +520,34 @@ fun ShortsScreen(
                         },
                         modifier = Modifier
                             .size(48.dp)
-                            .background(DeiBlack.copy(alpha = 0.5f), CircleShape)
+                            .background(DeiBlack.copy(alpha = 0.55f), CircleShape)
                     ) {
                         Icon(Icons.Filled.Share, contentDescription = "Compartir Short", tint = DeiWhite)
                     }
 
                     IconButton(
-                        onClick = { viewModel.openVideo(shortVideo) },
+                        onClick = {
+                            if (isCurrentPage && firstFrameRendered) {
+                                if (shortPlayer.isPlaying) {
+                                    shortPlayer.pause()
+                                    isPaused = true
+                                } else {
+                                    shortPlayer.play()
+                                    isPaused = false
+                                }
+                            } else {
+                                viewModel.openVideo(shortVideo)
+                            }
+                        },
                         modifier = Modifier
                             .size(48.dp)
                             .background(DeiRed, CircleShape)
                     ) {
-                        Icon(Icons.Filled.PlayArrow, contentDescription = "Abrir en reproductor completo", tint = DeiWhite)
+                        Icon(
+                            imageVector = if (isCurrentPage && firstFrameRendered && !isPaused) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            contentDescription = "Reproducir o pausar",
+                            tint = DeiWhite
+                        )
                     }
                 }
 
@@ -292,7 +568,10 @@ fun ShortsScreen(
                             Text(
                                 text = shortVideo.channelName,
                                 color = DeiWhite,
-                                style = MaterialTheme.typography.titleSmall
+                                fontWeight = FontWeight.SemiBold,
+                                style = MaterialTheme.typography.titleSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
                         Spacer(Modifier.width(10.dp))
@@ -355,7 +634,9 @@ fun ShortsScreen(
                                 draft = ""
                             }
                         },
-                        modifier = Modifier.clip(CircleShape).background(DeiRed)
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(DeiRed)
                     ) {
                         Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Enviar", tint = DeiWhite)
                     }

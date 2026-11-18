@@ -278,9 +278,15 @@ class ChannelAndVideoRepository(
             val sort = when (categoryLabel) {
                 "Tendencias" -> "-views"
                 "Para ti" -> "-likes"
+                "Inicio" -> "-views"
                 else -> "-publishedAt"
             }
-            val isLive = if (categoryLabel == "Directos") true else null
+            val isLive = when (categoryLabel) {
+                "Directos" -> true
+                "Inicio", "Para ti", "Tendencias" -> false
+                else -> null
+            }
+            val durationMin = if (categoryLabel == "Inicio" && query.isNullOrBlank()) 61 else null
             val langCode = mapLanguageCode(languageLabel)
 
             val response = peerTubeApi.searchVideos(
@@ -289,9 +295,35 @@ class ChannelAndVideoRepository(
                 sort = sort,
                 isLive = isLive,
                 categoryId = categoryId,
-                languageCode = langCode
+                languageCode = langCode,
+                durationMin = durationMin
             )
             val mapped = response.data.map { summary -> summary.toVideoEntity(categoryLabel) }
+            Result.success(mapped)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Fetches short-form global creator videos (<= 60s) from JoinPeerTube Federation.
+     */
+    suspend fun fetchWorldShorts(
+        query: String? = null,
+        languageLabel: String = "Todos"
+    ): Result<List<VideoEntity>> = withContext(Dispatchers.IO) {
+        try {
+            val langCode = mapLanguageCode(languageLabel)
+            val response = peerTubeApi.searchVideos(
+                search = query?.takeIf { it.isNotBlank() },
+                count = 16,
+                sort = "-views",
+                isLive = false,
+                languageCode = langCode,
+                durationMax = 60
+            )
+            val mapped = response.data
+                .map { summary -> summary.toVideoEntity("Shorts").copy(isShort = true) }
             Result.success(mapped)
         } catch (e: Exception) {
             Result.failure(e)
@@ -509,6 +541,13 @@ class ChannelAndVideoRepository(
             ?: account?.name?.takeIf { it.isNotBlank() }
             ?: (channel?.id ?: account?.id ?: 0L).toString()
         val encodedChannelId = if (host.isNotBlank()) "pt_ch_${host}|${channelHandle}" else "pt_ch_${channel?.id ?: 0L}"
+        val rawThumb = thumbnailUrl?.takeIf { it.isNotBlank() } ?: previewUrl?.takeIf { it.isNotBlank() }
+        val resolvedThumb = when {
+            rawThumb.isNullOrBlank() -> null
+            rawThumb.startsWith("http") -> rawThumb
+            host.isNotBlank() -> "https://$host$rawThumb"
+            else -> rawThumb
+        }
         return VideoEntity(
             id = "pt_${uuid.ifBlank { shortUUID }}",
             channelId = encodedChannelId,
@@ -518,7 +557,7 @@ class ChannelAndVideoRepository(
             title = name.ifBlank { "Video sin título" },
             description = description.orEmpty(),
             mediaUri = url,
-            thumbnailUri = thumbnailUrl ?: previewUrl,
+            thumbnailUri = resolvedThumb,
             durationSeconds = duration,
             isShort = duration in 1..60,
             isLive = isLive,

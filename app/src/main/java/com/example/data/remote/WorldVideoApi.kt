@@ -140,7 +140,9 @@ interface PeerTubeApiService {
         @Query("nsfw") nsfw: String = "false",
         @Query("isLive") isLive: Boolean? = null,
         @Query("categoryOneOf") categoryId: Int? = null,
-        @Query("languageOneOf") languageCode: String? = null
+        @Query("languageOneOf") languageCode: String? = null,
+        @Query("durationMin") durationMin: Int? = null,
+        @Query("durationMax") durationMax: Int? = null
     ): PeerTubeSearchResponse
 
     @GET

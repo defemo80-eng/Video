@@ -189,6 +189,11 @@ class DeiPlayViewModel(application: Application) : AndroidViewModel(application)
     private val _worldVideos = MutableStateFlow<List<VideoEntity>>(emptyList())
     val worldVideos: StateFlow<List<VideoEntity>> = _worldVideos.asStateFlow()
 
+    private val _worldShorts = MutableStateFlow<List<VideoEntity>>(emptyList())
+
+    private val _selectedShortId = MutableStateFlow<String?>(null)
+    val selectedShortId: StateFlow<String?> = _selectedShortId.asStateFlow()
+
     private val _syncedCreatorVideos = MutableStateFlow<List<VideoEntity>>(emptyList())
     val syncedCreatorVideos: StateFlow<List<VideoEntity>> = _syncedCreatorVideos.asStateFlow()
 
@@ -266,10 +271,13 @@ class DeiPlayViewModel(application: Application) : AndroidViewModel(application)
 
     val shortsVideos: StateFlow<List<VideoEntity>> = combine(
         deiPlayPublicVideos,
+        _worldShorts,
         _worldVideos,
         _syncedCreatorVideos
-    ) { local, world, synced ->
-        (local + synced + world).distinctBy { it.id }.filter { it.isShort && !it.isPost }
+    ) { local, worldShorts, world, synced ->
+        (local + synced + worldShorts + world)
+            .distinctBy { it.id }
+            .filter { it.isShort && !it.isPost }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     init {
@@ -380,6 +388,23 @@ class DeiPlayViewModel(application: Application) : AndroidViewModel(application)
         _searchQuery.value = query
     }
 
+    fun selectShortToOpen(shortId: String?) {
+        _selectedShortId.value = shortId
+    }
+
+    suspend fun resolvePlayableStreamsForShort(video: VideoEntity): com.example.data.repository.ResolvedPlaybackStreams {
+        val user = currentUser.value
+        val offline = if (user != null) db.libraryDao().getDownload(user.id, video.id) else null
+        if (offline != null && java.io.File(offline.localFilePath).exists()) {
+            val localUri = Uri.fromFile(java.io.File(offline.localFilePath)).toString()
+            return com.example.data.repository.ResolvedPlaybackStreams(
+                streams = listOf(com.example.data.repository.StreamQualityOption("${offline.qualityLabel} (Offline)", localUri)),
+                downloadPermitted = true
+            )
+        }
+        return channelVideoRepo.resolvePlayableStreams(video)
+    }
+
     fun refreshWorldVideos() {
         viewModelScope.launch {
             _isWorldLoading.value = true
@@ -389,9 +414,17 @@ class DeiPlayViewModel(application: Application) : AndroidViewModel(application)
                 categoryLabel = _selectedCategory.value,
                 languageLabel = _selectedLanguage.value
             )
+            val shortsRes = channelVideoRepo.fetchWorldShorts(
+                query = _searchQuery.value,
+                languageLabel = _selectedLanguage.value
+            )
             val ytKey = prefsState.value.youtubeApiKey
             val ytToken = prefsState.value.youtubeAccessToken
             val ytPopular = if (ytKey.isNotBlank()) ytRepo.fetchYouTubePopularIfConfigured(ytKey) else emptyList()
+
+            shortsRes.onSuccess { list ->
+                if (list.isNotEmpty()) _worldShorts.value = list
+            }
 
             res.onSuccess { peerTubeList ->
                 _worldVideos.value = (ytPopular + peerTubeList).distinctBy { it.id }

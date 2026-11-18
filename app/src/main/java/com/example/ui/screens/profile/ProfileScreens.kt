@@ -1,14 +1,19 @@
 package com.example.ui.screens.profile
 
 import android.Manifest
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -39,15 +44,21 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.PlaylistPlay
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.ThumbUp
 import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -71,12 +82,17 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.compose.AsyncImage
 import com.example.data.local.ThemeMode
 import com.example.ui.DeiPlayViewModel
 import com.example.ui.components.ChannelAvatar
@@ -84,6 +100,10 @@ import com.example.ui.components.EmptyStateCard
 import com.example.ui.components.formatCompactCount
 import com.example.ui.theme.DeiRed
 import com.example.ui.theme.DeiWhite
+import com.google.android.gms.auth.api.identity.AuthorizationRequest
+import com.google.android.gms.auth.api.identity.Identity
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.common.api.Scope
 
 @Composable
 fun ProfileScreen(
@@ -284,6 +304,12 @@ private fun ProfileMenuRow(
     }
 }
 
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun YouTubeConnectScreen(
@@ -295,10 +321,92 @@ fun YouTubeConnectScreen(
     val context = LocalContext.current
     val user by viewModel.currentUser.collectAsStateWithLifecycle()
     val prefs by viewModel.prefsState.collectAsStateWithLifecycle()
+    val feedVideos by viewModel.combinedFeedVideos.collectAsStateWithLifecycle()
+
+    var isConnectingGoogle by remember { mutableStateOf(false) }
+    var googleErrorMessage by remember { mutableStateOf<String?>(null) }
+    var showAdvancedOptions by remember { mutableStateOf(false) }
 
     var apiKey by remember(prefs.youtubeApiKey) { mutableStateOf(prefs.youtubeApiKey) }
     var clientId by remember(prefs.youtubeOAuthClientId) { mutableStateOf(prefs.youtubeOAuthClientId) }
     var accessToken by remember(prefs.youtubeAccessToken) { mutableStateOf(prefs.youtubeAccessToken) }
+
+    val authLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        isConnectingGoogle = false
+        try {
+            val authResult = Identity.getAuthorizationClient(context.findActivity() ?: context)
+                .getAuthorizationResultFromIntent(result.data)
+            val token = authResult.accessToken
+            if (!token.isNullOrBlank()) {
+                googleErrorMessage = null
+                accessToken = token
+                viewModel.syncYouTubeAccount(token)
+            } else {
+                googleErrorMessage = "No se recibió autorización de Google para leer tu canal de YouTube."
+            }
+        } catch (e: ApiException) {
+            googleErrorMessage = when (e.statusCode) {
+                16 -> "Autorización cancelada."
+                10 -> "Este APK requiere registrar su huella SHA-1 y YouTube Data API v3 en Google Cloud Console para autorizar cuentas automáticamente."
+                else -> "Error de Google (${e.statusCode}): ${e.localizedMessage ?: "no se pudo completar el inicio"}"
+            }
+        } catch (e: Exception) {
+            googleErrorMessage = e.localizedMessage ?: "No se pudo conectar con la cuenta de Google."
+        }
+    }
+
+    fun startGoogleYouTubeSignIn() {
+        isConnectingGoogle = true
+        googleErrorMessage = null
+        val requestedScopes = listOf(
+            Scope("https://www.googleapis.com/auth/youtube.readonly"),
+            Scope("https://www.googleapis.com/auth/userinfo.profile"),
+            Scope("https://www.googleapis.com/auth/userinfo.email")
+        )
+        val authRequest = AuthorizationRequest.builder()
+            .setRequestedScopes(requestedScopes)
+            .build()
+
+        Identity.getAuthorizationClient(context.findActivity() ?: context)
+            .authorize(authRequest)
+            .addOnSuccessListener { authorizationResult ->
+                if (authorizationResult.hasResolution() && authorizationResult.pendingIntent != null) {
+                    isConnectingGoogle = false
+                    runCatching {
+                        authLauncher.launch(
+                            IntentSenderRequest.Builder(authorizationResult.pendingIntent!!.intentSender).build()
+                        )
+                    }.onFailure {
+                        googleErrorMessage = it.localizedMessage ?: "No se pudo abrir el selector de cuentas de Google."
+                    }
+                } else {
+                    isConnectingGoogle = false
+                    val token = authorizationResult.accessToken
+                    if (!token.isNullOrBlank()) {
+                        accessToken = token
+                        viewModel.syncYouTubeAccount(token)
+                    } else {
+                        googleErrorMessage = "Google no devolvió un token de acceso para YouTube."
+                    }
+                }
+            }
+            .addOnFailureListener { e ->
+                isConnectingGoogle = false
+                val apiEx = e as? ApiException
+                googleErrorMessage = when (apiEx?.statusCode) {
+                    10 -> "Google Play Services requiere que el paquete de la app y su SHA-1 estén autorizados en Google Cloud con YouTube Data API v3 habilitada."
+                    else -> e.localizedMessage ?: "No se pudo iniciar la conexión con tu cuenta de Google."
+                }
+            }
+    }
+
+    val syncedOwnChannelVideos = remember(feedVideos, user?.youtubeChannelId) {
+        val ytChId = user?.youtubeChannelId
+        if (ytChId.isNullOrBlank()) emptyList()
+        else feedVideos.filter { it.sourcePlatform == "YOUTUBE" && it.channelId == "yt_$ytChId" }
+    }
 
     Scaffold(
         topBar = {
@@ -318,109 +426,274 @@ fun YouTubeConnectScreen(
                 .padding(padding)
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             if (user?.youtubeConnected == true) {
                 Surface(
-                    shape = RoundedCornerShape(16.dp),
+                    shape = RoundedCornerShape(20.dp),
                     color = MaterialTheme.colorScheme.surface,
                     tonalElevation = 3.dp,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        modifier = Modifier.padding(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            ChannelAvatar(user?.youtubeChannelAvatar, user?.youtubeChannelTitle ?: "YT", size = 56.dp)
-                            Spacer(Modifier.width(12.dp))
-                            Column {
-                                Text(user?.youtubeChannelTitle.orEmpty(), style = MaterialTheme.typography.titleLarge)
-                                Text("ID: ${user?.youtubeChannelId.orEmpty()}", style = MaterialTheme.typography.labelSmall)
+                            ChannelAvatar(
+                                avatarUri = user?.youtubeChannelAvatar,
+                                name = user?.youtubeChannelTitle ?: "YT",
+                                size = 64.dp,
+                                accentBorder = true
+                            )
+                            Spacer(Modifier.width(14.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = user?.youtubeChannelTitle.orEmpty(),
+                                        style = MaterialTheme.typography.titleLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Icon(
+                                        Icons.Filled.Verified,
+                                        contentDescription = "Canal conectado",
+                                        tint = DeiRed,
+                                        modifier = Modifier.height(18.dp)
+                                    )
+                                }
+                                Text(
+                                    text = "Canal oficial vinculado con Google",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                         }
-                        Text("Suscriptores oficiales: ${formatCompactCount(user?.youtubeSubscriberCount ?: 0L)}")
-                        Text("Videos publicados: ${user?.youtubeVideoCount ?: 0L}")
-                        Text("Visualizaciones totales: ${formatCompactCount(user?.youtubeViewCount ?: 0L)}")
-                        OutlinedButton(
-                            onClick = { viewModel.disconnectYouTube() },
-                            modifier = Modifier.fillMaxWidth()
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceEvenly
                         ) {
-                            Text("Desconectar cuenta de YouTube")
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    formatCompactCount(user?.youtubeSubscriberCount ?: 0L),
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text("Suscriptores", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    "${user?.youtubeVideoCount ?: 0L}",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text("Videos", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    formatCompactCount(user?.youtubeViewCount ?: 0L),
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text("Vistas", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Button(
+                                onClick = { startGoogleYouTubeSignIn() },
+                                enabled = !isConnectingGoogle,
+                                colors = ButtonDefaults.buttonColors(containerColor = DeiRed, contentColor = DeiWhite),
+                                shape = RoundedCornerShape(14.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Filled.Refresh, null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Actualizar")
+                            }
+                            OutlinedButton(
+                                onClick = { viewModel.disconnectYouTube() },
+                                shape = RoundedCornerShape(14.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Desconectar")
+                            }
+                        }
+                    }
+                }
+
+                if (syncedOwnChannelVideos.isNotEmpty()) {
+                    Text(
+                        text = "Videos de tu canal (${syncedOwnChannelVideos.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    syncedOwnChannelVideos.forEach { vid ->
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = MaterialTheme.colorScheme.surface,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { viewModel.openVideo(vid) }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                AsyncImage(
+                                    model = vid.thumbnailUri,
+                                    contentDescription = vid.title,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .width(116.dp)
+                                        .height(66.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                )
+                                Spacer(Modifier.width(12.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = vid.title,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = "${formatCompactCount(vid.viewsCount)} vistas",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Icon(Icons.Filled.PlayArrow, contentDescription = null, tint = DeiRed)
+                            }
+                        }
+                    }
+                }
+            } else {
+                Surface(
+                    shape = RoundedCornerShape(20.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 2.dp,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "Vincula tu canal con Google",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Inicia sesión únicamente con tu cuenta de Google para mostrar automáticamente tu canal de YouTube, suscriptores, videos subidos y suscripciones dentro de DeiPlay.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Button(
+                            onClick = { startGoogleYouTubeSignIn() },
+                            enabled = !isConnectingGoogle,
+                            colors = ButtonDefaults.buttonColors(containerColor = DeiRed, contentColor = DeiWhite),
+                            shape = RoundedCornerShape(14.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(52.dp)
+                                .testTag("youtube_google_connect_btn")
+                        ) {
+                            if (isConnectingGoogle) {
+                                CircularProgressIndicator(color = DeiWhite, strokeWidth = 2.dp, modifier = Modifier.height(20.dp))
+                                Spacer(Modifier.width(10.dp))
+                                Text("Conectando con Google...")
+                            } else {
+                                Icon(Icons.Filled.Tv, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Conectar con mi cuenta de Google", fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
                 }
             }
 
-            Surface(
-                shape = RoundedCornerShape(16.dp),
-                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Integración oficial con YouTube Data API v3", style = MaterialTheme.typography.titleSmall)
+            if (!googleErrorMessage.isNullOrBlank()) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = DeiRed.copy(alpha = 0.14f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
                     Text(
-                        "DeiPlay ya incluye el cliente oficial de YouTube Data API v3. Como actualmente no has configurado credenciales de Google Cloud, puedes usar todas las funciones globales de DeiPlay sin API Key, o ingresar aquí tu API Key / Token OAuth2 cuando las generes en Google Cloud Console (scope youtube.readonly).",
-                        style = MaterialTheme.typography.bodySmall
+                        text = googleErrorMessage!!,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(14.dp)
                     )
                 }
             }
 
-            OutlinedTextField(
-                value = apiKey,
-                onValueChange = { apiKey = it },
-                label = { Text("YouTube Data API v3 Key (opcional)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            OutlinedTextField(
-                value = clientId,
-                onValueChange = { clientId = it },
-                label = { Text("Google OAuth Client ID (opcional)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            if (clientId.isNotBlank()) {
-                OutlinedButton(
-                    onClick = {
-                        val oauthUrl = Uri.parse("https://accounts.google.com/o/oauth2/v2/auth")
-                            .buildUpon()
-                            .appendQueryParameter("client_id", clientId.trim())
-                            .appendQueryParameter("response_type", "token")
-                            .appendQueryParameter("redirect_uri", "http://localhost")
-                            .appendQueryParameter("scope", "https://www.googleapis.com/auth/youtube.readonly")
-                            .build()
-                        context.startActivity(Intent(Intent.ACTION_VIEW, oauthUrl))
-                    },
-                    modifier = Modifier.fillMaxWidth()
+            // Collapsed advanced options (hidden by default so standard users only see Google Account Sign-In)
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { showAdvancedOptions = !showAdvancedOptions }
+            ) {
+                Row(
+                    modifier = Modifier.padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Abrir autorización oficial de Google OAuth")
+                    Text(
+                        text = "Opciones avanzadas de desarrollador (opcional)",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Icon(
+                        imageVector = if (showAdvancedOptions) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
 
-            OutlinedTextField(
-                value = accessToken,
-                onValueChange = { accessToken = it },
-                label = { Text("Token OAuth2 de YouTube (Bearer)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedButton(
-                    onClick = { viewModel.saveYouTubeConfig(apiKey, clientId, accessToken) },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("Guardar claves")
-                }
-                Button(
-                    onClick = { viewModel.syncYouTubeAccount(accessToken) },
-                    colors = ButtonDefaults.buttonColors(containerColor = DeiRed, contentColor = DeiWhite),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("Sincronizar canal")
+            AnimatedVisibility(visible = showAdvancedOptions) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        value = apiKey,
+                        onValueChange = { apiKey = it },
+                        label = { Text("YouTube Data API v3 Key (opcional)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = clientId,
+                        onValueChange = { clientId = it },
+                        label = { Text("Google OAuth Client ID (opcional)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = accessToken,
+                        onValueChange = { accessToken = it },
+                        label = { Text("Token OAuth2 manual (Bearer)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedButton(
+                            onClick = { viewModel.saveYouTubeConfig(apiKey, clientId, accessToken) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Guardar") }
+                        Button(
+                            onClick = { viewModel.syncYouTubeAccount(accessToken) },
+                            colors = ButtonDefaults.buttonColors(containerColor = DeiRed, contentColor = DeiWhite),
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Sincronizar") }
+                    }
                 }
             }
         }

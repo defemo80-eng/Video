@@ -82,54 +82,60 @@ class DeiPlayRepositoryTest {
             nsfw: String,
             isLive: Boolean?,
             categoryId: Int?,
-            languageCode: String?
+            languageCode: String?,
+            durationMin: Int?,
+            durationMax: Int?
         ): PeerTubeSearchResponse {
-            return PeerTubeSearchResponse(
-                total = 2,
-                data = listOf(
-                    PeerTubeVideoSummary(
-                        id = 101L,
-                        uuid = "uuid-music-1",
-                        shortUUID = "short1",
-                        name = "Global Acoustic Session",
-                        description = "Live acoustic showcase from Madrid",
-                        duration = 240L,
-                        views = 1500L,
-                        likes = 120L,
-                        dislikes = 2L,
-                        isLive = isLive ?: false,
-                        thumbnailUrl = "https://example.org/thumb1.jpg",
-                        url = "https://peertube.example.org/w/uuid-music-1",
-                        category = PeerTubeNamedItem("1", "Música"),
-                        language = PeerTubeNamedItem("es", "Español"),
-                        channel = PeerTubeChannel(
-                            id = 55L,
-                            name = "madrid_sessions",
-                            displayName = "Madrid Sessions",
-                            host = "peertube.example.org"
-                        ),
-                        account = PeerTubeAccount(id = 10L, name = "madrid", displayName = "Madrid", host = "peertube.example.org"),
-                        tags = listOf("musica", "acustico")
+            val all = listOf(
+                PeerTubeVideoSummary(
+                    id = 101L,
+                    uuid = "uuid-music-1",
+                    shortUUID = "short1",
+                    name = "Global Acoustic Session",
+                    description = "Live acoustic showcase from Madrid",
+                    duration = 240L,
+                    views = 1500L,
+                    likes = 120L,
+                    dislikes = 2L,
+                    isLive = isLive ?: false,
+                    thumbnailUrl = "https://example.org/thumb1.jpg",
+                    url = "https://peertube.example.org/w/uuid-music-1",
+                    category = PeerTubeNamedItem("1", "Música"),
+                    language = PeerTubeNamedItem("es", "Español"),
+                    channel = PeerTubeChannel(
+                        id = 55L,
+                        name = "madrid_sessions",
+                        displayName = "Madrid Sessions",
+                        host = "peertube.example.org"
                     ),
-                    PeerTubeVideoSummary(
-                        id = 102L,
-                        uuid = "uuid-short-2",
-                        shortUUID = "short2",
-                        name = "60s Tech Tip",
-                        duration = 45L,
-                        views = 3200L,
-                        likes = 310L,
-                        url = "https://peertube.example.org/w/uuid-short-2",
-                        category = PeerTubeNamedItem("15", "Tecnología"),
-                        language = PeerTubeNamedItem("en", "English"),
-                        channel = PeerTubeChannel(
-                            id = 56L,
-                            name = "tech_world",
-                            displayName = "Tech World",
-                            host = "peertube.example.org"
-                        )
+                    account = PeerTubeAccount(id = 10L, name = "madrid", displayName = "Madrid", host = "peertube.example.org"),
+                    tags = listOf("musica", "acustico")
+                ),
+                PeerTubeVideoSummary(
+                    id = 102L,
+                    uuid = "uuid-short-2",
+                    shortUUID = "short2",
+                    name = "60s Tech Tip",
+                    duration = 45L,
+                    views = 3200L,
+                    likes = 310L,
+                    url = "https://peertube.example.org/w/uuid-short-2",
+                    category = PeerTubeNamedItem("15", "Tecnología"),
+                    language = PeerTubeNamedItem("en", "English"),
+                    channel = PeerTubeChannel(
+                        id = 56L,
+                        name = "tech_world",
+                        displayName = "Tech World",
+                        host = "peertube.example.org"
                     )
                 )
+            ).filter { item ->
+                (durationMin == null || item.duration >= durationMin) &&
+                    (durationMax == null || item.duration <= durationMax)
+            }
+            return PeerTubeSearchResponse(
+                total = all.size,
+                data = all
             )
         }
 
@@ -620,6 +626,11 @@ class DeiPlayRepositoryTest {
         val streams = channelVideoRepo.resolvePlayableStreams(worldVideos.first())
         assertEquals(listOf("1080p", "720p"), streams.streams.map { it.label })
         assertTrue(streams.downloadPermitted)
+
+        val worldShorts = channelVideoRepo.fetchWorldShorts().getOrThrow()
+        assertEquals(1, worldShorts.size)
+        assertTrue(worldShorts.first().isShort)
+        assertEquals("60s Tech Tip", worldShorts.first().title)
 
         // YouTube OAuth sync separates external YouTube subscriptions & imports own + subscribed creator uploads
         val syncResult = ytRepo.syncWithOAuthToken(user.id, "mock_oauth_token").getOrThrow()
