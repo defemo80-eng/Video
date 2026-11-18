@@ -19,39 +19,55 @@ jobs:
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Accept Android SDK licenses and install SDK 36.1
         run: |
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          mkdir -p "$SDK_ROOT/licenses"
+          printf "\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n" > "$SDK_ROOT/licenses/android-sdk-license"
+          printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n" > "$SDK_ROOT/licenses/android-sdk-preview-license"
+
           SDK_MGR="$(command -v sdkmanager || true)"
-          if [ -z "$SDK_MGR" ] && [ -n "$ANDROID_HOME" ]; then
-            SDK_MGR="$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1 || true)"
+          if [ -z "$SDK_MGR" ] && [ -n "$SDK_ROOT" ]; then
+            SDK_MGR="$(ls "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1 || true)"
           fi
+          echo "Using sdkmanager: $SDK_MGR"
           if [ -n "$SDK_MGR" ] && [ -x "$SDK_MGR" ]; then
-            yes | "$SDK_MGR" --licenses > /dev/null 2>&1 || true
-            "$SDK_MGR" "platforms;android-36.1" "build-tools;36.0.0" || true
+            yes | "$SDK_MGR" --licenses >/dev/null 2>&1 || true
+            "$SDK_MGR" --install "platforms;android-36.1" "build-tools;36.0.0"
           fi
+          ls -la "$SDK_ROOT/platforms" "$SDK_ROOT/build-tools"
 
       - name: Setup Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
 
-      - name: Restore debug keystore and env
+      - name: Restore debug keystore
         run: |
           if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
             base64 -d debug.keystore.base64 > debug.keystore
           fi
-          if [ ! -f .env ] && [ -f .env.example ]; then
-            cp .env.example .env
-          fi
+          ls -lh debug.keystore
 
       - name: Build Debug APK
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        run: >
+          gradle :app:assembleDebug
+          --no-daemon
+          --max-workers=2
+          -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8"
+          --stacktrace
+          --console=plain
 
       - name: Prepare DeiPlay APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk DeiPlay.apk
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk DeiPlay.apk
+          ls -lh DeiPlay.apk
 
       - name: Upload DeiPlay Debug APK Artifact
         uses: actions/upload-artifact@v4
@@ -61,7 +77,12 @@ jobs:
           if-no-files-found: error
 
       - name: Run Unit and Robolectric Tests
-        run: gradle :app:testDebugUnitTest --no-daemon
+        run: >
+          gradle :app:testDebugUnitTest
+          --no-daemon
+          --max-workers=2
+          -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8"
+          --console=plain
 
       - name: Build Signed Release APK (optional)
         env:
@@ -71,7 +92,7 @@ jobs:
         run: |
           if [ -n "$KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
             printf '%s' "$KEYSTORE_BASE64" | base64 -d > my-upload-key.jks
-            gradle :app:assembleRelease --no-daemon --stacktrace
+            gradle :app:assembleRelease --no-daemon --max-workers=2 -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8" --stacktrace --console=plain
             cp app/build/outputs/apk/release/app-release.apk DeiPlay-release.apk
             echo "HAS_RELEASE_APK=true" >> "$GITHUB_ENV"
           else
