@@ -2,10 +2,6 @@ name: Build DeiPlay APK
 
 on:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 permissions:
@@ -13,27 +9,36 @@ permissions:
 
 jobs:
   build-apk:
+    name: Build APK
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licenses and install SDK 36.1
+        run: |
+          SDK_MGR="$(command -v sdkmanager || true)"
+          if [ -z "$SDK_MGR" ] && [ -n "$ANDROID_HOME" ]; then
+            SDK_MGR="$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n 1 || true)"
+          fi
+          if [ -n "$SDK_MGR" ] && [ -x "$SDK_MGR" ]; then
+            yes | "$SDK_MGR" --licenses > /dev/null 2>&1 || true
+            "$SDK_MGR" "platforms;android-36.1" "build-tools;36.0.0" || true
+          fi
 
       - name: Setup Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '9.3.1'
 
-      - name: Restore debug keystore
+      - name: Restore debug keystore and env
         run: |
           if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
             base64 -d debug.keystore.base64 > debug.keystore
@@ -42,13 +47,10 @@ jobs:
             cp .env.example .env
           fi
 
-      - name: Run unit & Robolectric tests
-        run: gradle :app:testDebugUnitTest --no-daemon
-
       - name: Build Debug APK
-        run: gradle :app:assembleDebug --no-daemon
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Prepare APK artifact
+      - name: Prepare DeiPlay APK
         run: cp app/build/outputs/apk/debug/app-debug.apk DeiPlay.apk
 
       - name: Upload DeiPlay Debug APK Artifact
@@ -56,19 +58,28 @@ jobs:
         with:
           name: DeiPlay-APK
           path: DeiPlay.apk
+          if-no-files-found: error
 
-      - name: Build Signed Release APK (optional if keystore secrets exist)
-        if: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+      - name: Run Unit and Robolectric Tests
+        run: gradle :app:testDebugUnitTest --no-daemon
+
+      - name: Build Signed Release APK (optional)
         env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > my-upload-key.jks
-          gradle :app:assembleRelease --no-daemon
-          cp app/build/outputs/apk/release/app-release.apk DeiPlay-release.apk
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > my-upload-key.jks
+            gradle :app:assembleRelease --no-daemon --stacktrace
+            cp app/build/outputs/apk/release/app-release.apk DeiPlay-release.apk
+            echo "HAS_RELEASE_APK=true" >> "$GITHUB_ENV"
+          else
+            echo "No release keystore secrets configured; skipping signed release APK."
+          fi
 
       - name: Upload DeiPlay Release APK Artifact
-        if: ${{ secrets.KEYSTORE_BASE64 != '' && secrets.STORE_PASSWORD != '' && secrets.KEY_PASSWORD != '' }}
+        if: env.HAS_RELEASE_APK == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: DeiPlay-Release-APK
